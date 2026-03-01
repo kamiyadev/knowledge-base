@@ -1,0 +1,141 @@
+#!/bin/bash
+set -euo pipefail
+
+# =========================
+# 設定情報
+# =========================
+URL_LOGIN=https://login.microsoftonline.com
+URL_GRAPH=https://graph.microsoft.com
+TENANT_ID=""
+CLIENT_ID=""
+RT_FILE="./refresh_token.txt"
+OUTPUT_FILE="./output/users_$(date +%Y%m%d_%H%M%S).txt"
+
+mkdir -p ./output
+
+# =========================
+# 共通関数
+# =========================
+curl_exec() {
+    local METHOD=$1
+    local URL=$2
+    local DATA=${3:-}
+    local HEADER=${4:-}
+
+    RESPONSE=$(curl -sS -w "\n%{http_code}" -X "$METHOD" "$URL" \
+        ${HEADER:+-H "$HEADER"} \
+        ${DATA:+-d "$DATA"} ) || {
+    echo "[NETWORK_ERROR] curl execution failed"
+    exit 1
+    }
+
+    HTTP_STATUS=$(echo "$RESPONSE" | tail -n1)
+    BODY=$(echo "$RESPONSE" | sed '$d')
+
+    echo "$HTTP_STATUS|$BODY"
+}
+
+handle_entra_error() {
+    local STATUS=$1
+    local BODY=$2
+
+    ERROR_CODE=$(echo "$BODY" | jq -r '.error.code // empty')
+    ERROR_MSG=$(echo "$BODY" | jq -r '.error.message // empty')
+
+    echo "[ENTRA_ID_ERROR] HTTP=$STATUS CODE=$ERROR_CODE MESSAGE=$ERROR_MSG"
+
+    case "$STATUS" in
+        401)
+            echo "Authentication error"
+            ;;
+        403)
+            echo "Authorization error"
+            ;;
+        429)
+            echo "Rate limit exceeded. Retry after sleep."
+            sleep 5
+            ;;
+        *)
+            echo "Unexpected Graph API error"
+            ;;
+    esac
+    exit 1
+}
+
+# =========================
+# B-1. ログイン
+# =========================
+if [ ! -f "$RT_FILE" ]; then
+    echo "Initial login (device code flow)"
+
+    RESP=$(curl_exec POST \
+        "${URL_LOGIN}/${TENANT_ID}/oauth2/v2.0/devicecode" \
+        "client_id=${CLIENT_ID}&scope=${URL_GRAPH}/.default offline_access")
+
+    STATUS=${RESP%%|*}
+    BODY=${RESP#*|}
+
+    [ "$STATUS" != "200" ] && handle_entra_error "$STATUS" "$BODY"
+
+    USER_CODE=$(echo "$BODY" | jq -r '.user_code')
+    DEV_CODE=$(echo "$BODY" | jq -r '.device_code')
+    URI=$(echo "$BODY" | jq -r '.verification_uri')
+
+    echo "1. Go to: $URI"
+    echo "2. Enter Code: $USER_CODE"
+    read -p "Press Enter after authorization..."
+
+    RESP=$(curl_exec POST \
+        "${URL_LOGIN}/${TENANT_ID}/oauth2/v2.0/token" \
+        "client_id=${CLIENT_ID}&grant_type=urn:ietf:params:oauth:grant-type:device_code&device_code=${DEV_CODE}")
+
+else
+    echo "Login using refresh token"
+
+    RT_SAVED=$(cat "$RT_FILE")
+
+    RESP=$(curl_exec POST \
+        "${URL_LOGIN}/${TENANT_ID}/oauth2/v2.0/token" \
+        "client_id=${CLIENT_ID}&grant_type=refresh_token&scope=${URL_GRAPH}/.default offline_access&refresh_token=${RT_SAVED}")
+fi
+
+STATUS=${RESP%%|*}
+BODY=${RESP#*|}
+
+[ "$STATUS" != "200" ] && handle_entra_error "$STATUS" "$BODY"
+
+# =========================
+# トークン処理
+# =========================
+TOKEN=$(echo "$BODY" | jq -r '.access_token')
+RT_NEW=$(echo "$BODY" | jq -r '.refresh_token')
+
+if [ -z "$TOKEN" ] || [ "$TOKEN" = "null" ]; then
+    echo "[ERROR] Failed to obtain access token"
+    exit 1
+fi
+
+echo "$RT_NEW" > "$RT_FILE"
+
+# =========================
+# X-1. Graph API 実行
+# =========================
+echo "Fetching users..."
+
+NEXT_URL="${URL_GRAPH}/v1.0/users?\$top=2&\$select=id,displayName,userPrincipalName"
+
+while [ -n "$NEXT_URL" ]; do
+    RESP=$(curl_exec GET "$NEXT_URL" "" "Authorization: Bearer ${TOKEN}")
+
+    STATUS=${RESP%%|*}
+    BODY=${RESP#*|}
+
+    if [[ "$STATUS" =~ ^2 ]]; then
+        echo "$BODY" | jq -c '.value[]' >> "$OUTPUT_FILE"
+        NEXT_URL=$(echo "$BODY" | jq -r '."@odata.nextLink" // empty')
+    else
+        handle_entra_error "$STATUS" "$BODY"
+    fi
+done
+
+echo "Completed successfully. Output: $OUTPUT_FILE"

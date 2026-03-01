@@ -1,0 +1,26 @@
+execute curl command
+get exit_code, stderr, stdout, http_status
+
+if exit_code != 0:
+    # curl / ネットワークエラー
+    log("NETWORK_ERROR", stderr)
+    exit 1
+
+if http_status is 2xx:
+    parse JSON
+    process user list
+    exit 0
+else:
+    parse JSON error
+    log("ENTRA_ID_ERROR", http_status, error.code, error.message)
+
+    if http_status == 401:
+        log("Authentication error")
+    elif http_status == 403:
+        log("Authorization error")
+    elif http_status == 429:
+        sleep and retry
+    else:
+        log("Unexpected Graph API error")
+
+    exit 1

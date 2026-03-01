@@ -1,0 +1,61 @@
+function get_users_from_entra_id():
+
+    # =========================
+    # Step 1: Graph API 呼び出し
+    # =========================
+    result = exec_curl_request()
+
+    # =================================
+    # Step 2: curl 実行レベルの判定
+    # =================================
+    if result.exit_code != 0:
+        # ネットワーク／curlエラー
+        log_error("NETWORK_ERROR", result.stderr)
+        notify_if_needed("Network error occurred")
+        return FAILURE
+
+    # =================================
+    # Step 3: HTTP レスポンス判定
+    # =================================
+    http_status = result.http_status
+    response_body = result.body
+
+    if http_status >= 200 and http_status < 300:
+        # 正常系
+        users = parse_users(response_body)
+        return SUCCESS(users)
+
+    # =================================
+    # Step 4: Entra ID 論理エラー判定
+    # =================================
+    error_json = parse_json(response_body)
+
+    error_code    = error_json.error.code
+    error_message = error_json.error.message
+
+    log_error("ENTRA_ID_ERROR", http_status, error_code, error_message)
+
+    # =================================
+    # Step 5: エラー種別ごとの対応
+    # =================================
+    switch http_status:
+        case 401:
+            # 認証エラー
+            handle_auth_error()
+            break
+
+        case 403:
+            # 権限エラー
+            handle_authorization_error()
+            break
+
+        case 429:
+            # レート制限
+            wait_and_retry()
+            break
+
+        default:
+            # その他の論理エラー
+            handle_generic_error()
+
+    return FAILURE
